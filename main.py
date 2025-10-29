@@ -7,9 +7,9 @@ import os
 app = FastAPI(title="JR station Weather API")
 
 # === 環境変数 ===
-OPENWEATHER_API_KEY = os.getenv("1afb66f10a65a47c27fbf31becbdf6b0")
-UPSTASH_URL = os.getenv("https://real-lioness-6459.upstash.io")
-UPSTASH_TOKEN = os.getenv("ARk7AAImcDIwYTJjMWU1YWExNDI0ZjUwYTJhMGJhM2Q4ZTk0OGJlMXAyNjQ1OQ")
+OPENWEATHER_API_KEY = os.getenv("OPENWEATHER_API_KEY")
+UPSTASH_URL = os.getenv("UPSTASH_URL")
+UPSTASH_TOKEN = os.getenv("UPSTASH_TOKEN")
 
 # === Upstash Redis 接続 ===
 redis = Redis(url=UPSTASH_URL, token=UPSTASH_TOKEN)
