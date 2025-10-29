@@ -74,7 +74,7 @@ def get_weather():
         })
 
     # キャッシュを3時間保持
-    redis.set(cache_key, results, ex=3 * 60 * 60)
+    redis.set(cache_key, results, ex=2 * 60 * 60)
 
     return JSONResponse(content={"source": "api", "data": results})
 
