@@ -1,0 +1,14 @@
+services:
+  - type: web
+    name: weather-api
+    env: python
+    plan: free
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "uvicorn main:app --host 0.0.0.0 --port $PORT"
+    envVars:
+      - key: OPENWEATHER_API_KEY
+        sync: false
+      - key: UPSTASH_URL
+        sync: false
+      - key: UPSTASH_TOKEN
+        sync: false
