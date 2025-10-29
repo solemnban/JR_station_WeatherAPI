@@ -1,8 +1,9 @@
 from fastapi import FastAPI
-from fastapi.responses import JSONResponse
-import requests
 from upstash_redis import Redis
+import requests
 import os
+import json
+from datetime import datetime, timedelta, timezone
 
 app = FastAPI(title="JR station Weather API")
 
@@ -11,10 +12,9 @@ OPENWEATHER_API_KEY = os.getenv("OPENWEATHER_API_KEY")
 UPSTASH_URL = os.getenv("UPSTASH_URL")
 UPSTASH_TOKEN = os.getenv("UPSTASH_TOKEN")
 
-# === Upstash Redis 接続 ===
 redis = Redis(url=UPSTASH_URL, token=UPSTASH_TOKEN)
 
-# === 対象地点 ===
+# === 取得対象地点 ===
 LOCATIONS = [
     {"name": "広島", "lat": 34.398, "lon": 132.461},
     {"name": "東広島", "lat": 34.416, "lon": 132.7},
@@ -27,57 +27,77 @@ LOCATIONS = [
     {"name": "下関", "lat": 33.948, "lon": 130.925},
 ]
 
-OPENWEATHER_URL = "https://api.openweathermap.org/data/2.5/forecast"
 
 @app.get("/weather")
 def get_weather():
-    """9地点の天気予報をキャッシュ付きで取得"""
+    """
+    広島〜山口周辺9地点の天気予報を返す。
+    ・今日〜翌日23:59までのデータ
+    ・キャッシュ：2時間
+    ・出力フォーマットはAPI取得時とキャッシュ取得時で完全一致
+    """
     cache_key = "weather:hiroshima-region"
-    cached_data = redis.get(cache_key)
+    cached = redis.get(cache_key)
 
-    # キャッシュヒット
-    if cached_data:
-        print("🔹 Using cached weather data")
-        return JSONResponse(content={"source": "cache", "data": cached_data})
+    # === キャッシュが存在すれば返す ===
+    if cached:
+        try:
+            data = json.loads(cached)
+            return {"source": "cache", "data": data}
+        except Exception:
+            # JSONデコードできない場合はそのまま返す
+            return {"source": "cache", "data": cached}
 
-    print("⚡ Fetching data from OpenWeather API")
+    # === キャッシュがなければAPIから取得 ===
     results = []
+    JST = timezone(timedelta(hours=9))
+    now_jst = datetime.now(JST)
+    tomorrow_end = (now_jst + timedelta(days=1)).replace(hour=23, minute=59, second=59)
 
     for loc in LOCATIONS:
-        params = {
-            "lat": loc["lat"],
-            "lon": loc["lon"],
-            "appid": OPENWEATHER_API_KEY,
-            "units": "metric",
-            "lang": "ja",
-        }
+        try:
+            res = requests.get(
+                "https://api.openweathermap.org/data/2.5/forecast",
+                params={
+                    "lat": loc["lat"],
+                    "lon": loc["lon"],
+                    "appid": OPENWEATHER_API_KEY,
+                    "units": "metric",
+                    "lang": "ja",
+                },
+                timeout=10,
+            )
+            res.raise_for_status()
+            data = res.json()
+        except Exception as e:
+            # APIエラー時はスキップ（もしくは空データで埋める）
+            print(f"Error fetching data for {loc['name']}: {e}")
+            continue
 
-        res = requests.get(OPENWEATHER_URL, params=params)
-        data = res.json()
+        # 期間内データを抽出
+        forecasts = []
+        for entry in data.get("list", []):
+            dt_utc = datetime.utcfromtimestamp(entry["dt"]).replace(tzinfo=timezone.utc)
+            dt_jst = dt_utc.astimezone(JST)
 
-        # 最新の3時間予報データ
-        forecast = data["list"][0]
-
-        # 降水量（3時間分を1時間あたりに換算）
-        rain_3h = forecast.get("rain", {}).get("3h", 0)
-        rain_1h = round(rain_3h / 3, 2)
+            if now_jst <= dt_jst <= tomorrow_end:
+                forecasts.append({
+                    "datetime_jst": dt_jst.strftime("%Y-%m-%d %H:%M"),
+                    "temp": entry["main"]["temp"],
+                    "rain_1h": entry.get("rain", {}).get("3h", 0) / 3,  # 3h→1h換算
+                    "wind_speed": entry["wind"]["speed"],
+                    "wind_deg": entry["wind"]["deg"],
+                    "weather": entry["weather"][0]["description"],
+                })
 
         results.append({
             "name": loc["name"],
             "lat": loc["lat"],
             "lon": loc["lon"],
-            "temp": forecast["main"]["temp"],
-            "rain_1h": rain_1h,
-            "wind_speed": forecast["wind"]["speed"],
-            "wind_deg": forecast["wind"]["deg"],
-            "timestamp": forecast["dt_txt"]
+            "forecast": forecasts,
         })
 
-    # キャッシュを3時間保持
-    redis.set(cache_key, results, ex=2 * 60 * 60)
+    # === Redisに保存（2時間キャッシュ） ===
+    redis.set(cache_key, json.dumps(results), ex=2 * 60 * 60)
 
-    return JSONResponse(content={"source": "api", "data": results})
-
-@app.get("/")
-def home():
-    return {"message": "✅ FastAPI + Upstash + OpenWeather API ready!"}
+    return {"source": "api", "data": results}
