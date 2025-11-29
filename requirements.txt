@@ -2,3 +2,5 @@ fastapi
 uvicorn
 requests
 upstash-redis
+lightgbm
+pandas
