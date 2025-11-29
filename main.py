@@ -1,20 +1,19 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from upstash_redis import Redis
 import requests
 import os
 import json
 from datetime import datetime, timedelta, timezone
+import time
 
 app = FastAPI(title="JR Station Weather API")
 
-# === 環境変数 ===
 OPENWEATHER_API_KEY = os.getenv("OPENWEATHER_API_KEY")
 UPSTASH_URL = os.getenv("UPSTASH_URL")
 UPSTASH_TOKEN = os.getenv("UPSTASH_TOKEN")
 
 redis = Redis(url=UPSTASH_URL, token=UPSTASH_TOKEN)
 
-# === 対象地点 ===
 LOCATIONS = [
     {"name": "広島", "lat": 34.398, "lon": 132.461},
     {"name": "東広島", "lat": 34.416, "lon": 132.7},
@@ -30,24 +29,41 @@ LOCATIONS = [
 
 @app.get("/weather")
 def get_weather():
-    """
-    広島〜山口周辺9地点の天気予報を返す。
-    ・出力項目: 気温, 風向, 風速, 前1時間降水量
-    ・期間: 現在〜翌日23:59 (JST)
-    ・キャッシュ: 2時間
-    """
     cache_key = "weather:hiroshima-region"
-    cached = redis.get(cache_key)
+    lock_key = "lock:hiroshima-region"
 
-    # --- キャッシュがあれば使用 ---
+    # ====== (1) Redis 障害を検知 ======
+    try:
+        cached = redis.get(cache_key)
+    except:
+        raise HTTPException(503, "Cache server unavailable")
+
     if cached:
         try:
             data = json.loads(cached)
-            return {"source": "cache", "data": data}
-        except Exception:
-            return {"source": "cache", "data": cached}
+        except:
+            data = cached
+        return {"source": "cache", "data": data}
 
-    # --- APIから新規取得 ---
+    # ====== (2) ロックを取得（キャッシュミスが同時多発しないように） ======
+    lock_acquired = False
+    try:
+        lock_acquired = redis.set(lock_key, "1", nx=True, ex=30)  # 30秒ロック
+    except:
+        raise HTTPException(503, "Cache server unavailable")
+
+    # すでにロックがある = 他リクエストがAPI取得中 → 少し待つ
+    if not lock_acquired:
+        time.sleep(1.5)
+        try:
+            cached2 = redis.get(cache_key)
+            if cached2:
+                return {"source": "cache(delayed)", "data": json.loads(cached2)}
+        except:
+            raise HTTPException(503, "Cache server unavailable")
+        raise HTTPException(429, "Please retry soon")  # ロック中
+
+    # ====== (3) API 実行はここで1回だけ ======
     results = []
     JST = timezone(timedelta(hours=9))
     now_jst = datetime.now(JST)
@@ -72,17 +88,15 @@ def get_weather():
             print(f"Error fetching data for {loc['name']}: {e}")
             continue
 
-        # 対象期間のみ抽出
         forecasts = []
         for entry in data.get("list", []):
             dt_utc = datetime.utcfromtimestamp(entry["dt"]).replace(tzinfo=timezone.utc)
             dt_jst = dt_utc.astimezone(JST)
-
             if now_jst <= dt_jst <= tomorrow_end:
                 forecasts.append({
                     "datetime_jst": dt_jst.strftime("%Y-%m-%d %H:%M"),
                     "temp": entry["main"]["temp"],
-                    "rain_1h": entry.get("rain", {}).get("3h", 0) / 3,  # 3時間→1時間換算
+                    "rain_1h": entry.get("rain", {}).get("3h", 0) / 3,
                     "wind_speed": entry["wind"]["speed"],
                     "wind_deg": entry["wind"]["deg"],
                 })
@@ -94,7 +108,11 @@ def get_weather():
             "forecast": forecasts,
         })
 
-    # --- キャッシュ保存（2時間） ---
-    redis.set(cache_key, json.dumps(results), ex=2 * 60 * 60)
+    # ====== (4) キャッシュ保存 ======
+    try:
+        redis.set(cache_key, json.dumps(results), ex=2 * 60 * 60)
+        redis.delete(lock_key)
+    except:
+        raise HTTPException(503, "Cache server unavailable")
 
     return {"source": "api", "data": results}
