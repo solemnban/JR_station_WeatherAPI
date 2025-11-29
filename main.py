@@ -3,133 +3,108 @@ from upstash_redis import Redis
 import requests
 import os
 import json
-from datetime import datetime, timedelta, timezone
-import lightgbm as lgb
 import pandas as pd
 import numpy as np
+import lightgbm as lgb
+from datetime import datetime, timedelta, timezone
+import time
 
-app = FastAPI(title="JR Station Delay Prediction API")
+app = FastAPI(title="JR Delay Prediction API")
 
+# ==============================
 # 環境変数
-OPENWEATHER_API_KEY = os.getenv("OPENWEATHER_API_KEY")
+# ==============================
 UPSTASH_URL = os.getenv("UPSTASH_URL")
 UPSTASH_TOKEN = os.getenv("UPSTASH_TOKEN")
-
-# Redis クライアント
 redis = Redis(url=UPSTASH_URL, token=UPSTASH_TOKEN)
 
-# 学習済みモデルロード
-MODEL_FILE = "best_delay_lgbm.txt"
-model = lgb.Booster(model_file=MODEL_FILE)
+# 学習済みモデル読み込み
+model = lgb.Booster(model_file="best_delay_lgbm.txt")
 
-# 対象地点
-LOCATIONS = [
-    {"name": "広島", "lat": 34.398, "lon": 132.461},
-    {"name": "東広島", "lat": 34.416, "lon": 132.7},
-    {"name": "本郷", "lat": 34.435, "lon": 132.918},
-    {"name": "廿日市", "lat": 34.365, "lon": 132.19},
-    {"name": "岩国", "lat": 34.155, "lon": 132.178},
-    {"name": "下松", "lat": 34.01, "lon": 131.871},
-    {"name": "山口", "lat": 34.161, "lon": 131.461},
-    {"name": "宇部", "lat": 33.93, "lon": 131.278},
-    {"name": "下関", "lat": 33.948, "lon": 130.925},
-]
+# 過去の遅延時間の平均値（目安用）
+delay_stats = pd.read_csv("delay_weather_3hour_numeric.csv")
+min_delay_mean = delay_stats["遅延時間（最小）"].dropna().mean()
+max_delay_mean = delay_stats["遅延時間（最大）"].dropna().mean()
 
-JST = timezone(timedelta(hours=9))
+# モデル特徴量
+model_features = model.feature_name()
+
+# ==============================
+# 天気予報APIのURL
+# ==============================
+WEATHER_API_URL = "https://jr-station-weatherapi.onrender.com/weather"
 
 @app.get("/predict_delay")
 def predict_delay():
-    now_jst = datetime.now(JST)
-    cache_key = f"delay_prediction:{now_jst.strftime('%Y-%m-%d-%H')}"
+    cache_key = "delay_prediction_cache"
 
     # キャッシュ確認
     try:
         cached = redis.get(cache_key)
         if cached:
-            return {"source": "cache", "predictions": json.loads(cached)}
+            return {"source": "cache", "data": json.loads(cached)}
     except:
         pass
 
-    # 予測用データ作成
-    all_forecasts = []
-    tomorrow_end = (now_jst + timedelta(days=1)).replace(hour=23, minute=59, second=59)
+    # 天気API取得
+    try:
+        res = requests.get(WEATHER_API_URL, timeout=10)
+        res.raise_for_status()
+        weather_data = res.json()["data"]
+    except Exception as e:
+        raise HTTPException(503, f"Failed to fetch weather data: {e}")
 
-    for loc in LOCATIONS:
-        try:
-            res = requests.get(
-                "https://api.openweathermap.org/data/2.5/forecast",
-                params={
-                    "lat": loc["lat"],
-                    "lon": loc["lon"],
-                    "appid": OPENWEATHER_API_KEY,
-                    "units": "metric",
-                    "lang": "ja",
-                },
-                timeout=10,
-            )
-            res.raise_for_status()
-            data = res.json()
-        except Exception as e:
-            print(f"Error fetching data for {loc['name']}: {e}")
-            continue
+    # JSON -> データフレーム
+    rows = []
+    datetimes = []
 
-        for entry in data.get("list", []):
-            dt_utc = datetime.utcfromtimestamp(entry["dt"]).replace(tzinfo=timezone.utc)
-            dt_jst = dt_utc.astimezone(JST)
-            if now_jst <= dt_jst <= tomorrow_end:
-                all_forecasts.append({
-                    "datetime_jst": dt_jst.strftime("%Y-%m-%d %H:%M"),
-                    "precipitation": entry.get("rain", {}).get("3h", 0) / 3,
-                    "temperature": entry["main"]["temp"],
-                    "wind_speed": entry["wind"]["speed"],
-                    "wind_direction_deg": entry["wind"]["deg"],
-                    # wind_dir_sin / cos 計算
-                    "wind_dir_sin": np.sin(np.deg2rad(entry["wind"]["deg"])),
-                    "wind_dir_cos": np.cos(np.deg2rad(entry["wind"]["deg"])),
-                })
+    for station in weather_data:
+        for f in station["forecast"]:
+            dt = f["datetime_jst"]
+            datetimes.append(dt)
 
-    if not all_forecasts:
-        raise HTTPException(500, "No forecast data available")
+            row = {
+                "台風": 1 if f.get("typhoon", 0) else 0,
+                "大雪": 1 if f.get("heavy_snow", 0) else 0,
+                "大雨": 1 if f.get("heavy_rain", 0) else 0,
+                "濃霧": 1 if f.get("dense_fog", 0) else 0,
+                "霜": 1 if f.get("frost", 0) else 0,
+                "強風": 1 if f.get("strong_wind", 0) else 0,
+                "precipitation": f["rain_1h"],
+                "temperature": f["temp"],
+                "wind_speed": f["wind_speed"],
+                "wind_direction_deg": f["wind_deg"],
+                "wind_dir_sin": np.sin(np.deg2rad(f["wind_deg"])),
+                "wind_dir_cos": np.cos(np.deg2rad(f["wind_deg"])),
+            }
+            rows.append(row)
 
-    # DataFrame 化
-    df = pd.DataFrame(all_forecasts)
+    df_weather = pd.DataFrame(rows)
+    df_weather["datetime_jst"] = datetimes
 
-    # 運休フラグは 0 に固定（学習時と同じ列順に注意）
-    df["運休フラグ_正常"] = 1
-    df["運休フラグ_終日運転取りやめ"] = 0
-    # 文字列列はモデル学習時に one-hot 化済みなら追加列を作成
-    for col in ["wind_direction_北北東","wind_direction_北北西","wind_direction_北東","wind_direction_北西",
-                "wind_direction_南","wind_direction_南南東","wind_direction_南南西","wind_direction_南東",
-                "wind_direction_南西","wind_direction_東","wind_direction_東北東","wind_direction_東南東",
-                "wind_direction_西","wind_direction_西北西","wind_direction_西南西","wind_direction_静穏",
-                "weather_location_Higashihiroshima","weather_location_Hiroshima","weather_location_Hongo",
-                "weather_location_Iwakuni","weather_location_Shimonoseki","weather_location_Ube","weather_location_Yamaguchi"]:
-        if col not in df.columns:
-            df[col] = 0
-
-    # 学習時と同じ列順に並べる（必須）
-    model_cols = model.feature_name()
-    df = df[model_cols]
+    # モデル列に合わせる
+    for col in model_features:
+        if col not in df_weather.columns:
+            df_weather[col] = 0
+    df_weather = df_weather[model_features]
 
     # 予測
-    pred_probs = model.predict(df)
+    y_pred_prob = model.predict(df_weather)
 
-    # 文章化
+    # 日付ごとの結果にまとめる
     results = []
-    for i, row in df.iterrows():
-        date_str = all_forecasts[i]["datetime_jst"]
-        prob = pred_probs[i]
-        if prob > 0.5:
-            text = f"{date_str} は {prob*100:.1f}% の確率で遅延が発生する可能性があります。"
-        else:
-            text = f"{date_str} は遅延の可能性は低いです。"
-        results.append(text)
+    for i, prob in enumerate(y_pred_prob):
+        dt_str = datetimes[i]
+        pct = round(prob * 100, 1)
+        results.append({
+            "datetime": dt_str,
+            "delay_probability": pct
+        })
 
-    # キャッシュ保存（TTL: 3時間）
+    # キャッシュ保存（2時間）
     try:
-        redis.set(cache_key, json.dumps(results), ex=3*60*60)
+        redis.set(cache_key, json.dumps(results), ex=2*60*60)
     except:
         pass
 
-    return {"source": "api", "predictions": results}
-
+    return {"source": "api", "data": results}
