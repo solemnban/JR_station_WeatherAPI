@@ -1,0 +1,33 @@
+name: Execute WestJR Fetcher
+
+on:
+  workflow_dispatch: # cron-job.orgからのAPIトリガーを待ち受ける
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # リポジトリへの自動書き込み権限を許可
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install dependencies
+        run: pip install westjr
+
+      - name: Run Fetch Script
+        run: python fetch_train_positions.py
+
+      - name: Commit and Push changes
+        run: |
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+          git add data/train_logs.csv
+          # 変更がある場合のみ、自動コミットしてdevelopブランチにプッシュ
+          # [skip ci] を入れることで、プッシュによるワークフローの無限ループを防ぎます
+          git diff --quiet && git diff --staged --quiet || (git commit -m "Auto-logging train data [skip ci]" && git push origin develop)
