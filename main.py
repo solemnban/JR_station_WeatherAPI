@@ -26,7 +26,7 @@ model = lgb.Booster(model_file="best_delay_lgbm.txt")
 model_features = model.feature_name()
 
 # ==============================
-# 過去の遅延時間平均値
+# 過去の遅延時間平均値（質問2: そのまま維持）
 # ==============================
 delay_stats = pd.read_csv("delay_weather_3hour_numeric.csv")
 min_delay_mean = delay_stats["遅延時間（最小）"].dropna().mean()
@@ -54,7 +54,6 @@ JST = timezone(timedelta(hours=9))
 # ============================================================
 @app.get("/weather")
 def get_weather_endpoint():
-
     cache_key = "weather_forecast_cache"
 
     # キャッシュ確認
@@ -79,6 +78,7 @@ def get_weather_endpoint():
                     "lang": "ja",
                 },
                 timeout=10,
+                 Sherwood=True
             )
             res.raise_for_status()
             ow_data = res.json()
@@ -126,24 +126,22 @@ def get_weather_endpoint():
 
 
 # ============================================================
-# 2️⃣ /predict_delay 遅延予測 API
+# 2️⃣ /predict_delay 遅延予測 API（改善版）
 # ============================================================
 @app.get("/predict_delay")
 def predict_delay():
-
-    # まず内部で天気 API を呼ぶ
+    # 内部で天気 API を呼ぶ
     weather_res = get_weather_endpoint()
     weather_data = weather_res["data"]
 
     all_rows = []
-    all_datetimes = []
+    meta_info = []  # 地点名と日時を記録する用
 
     # ---------------------
     # 天気から特徴量生成
     # ---------------------
     for loc in weather_data:
         for f in loc["forecast"]:
-
             dt = f["datetime_jst"]
             weather_main = f["weather"]
             rain_3h = f["rain_3h"]
@@ -162,23 +160,10 @@ def predict_delay():
                 "Tornado" in weather_main or
                 "Squall" in weather_main
             )
-
-            is_heavy_snow = (
-                "Snow" in weather_main and snow_3h >= 5 and temp <= 2
-            )
-
-            is_heavy_rain = (
-                "Rain" in weather_main and rain_3h >= 15
-            )
-
-            is_dense_fog = (
-                visibility <= 200 or "Fog" in weather_main or "Mist" in weather_main
-            )
-
-            is_frost = (
-                temp <= 3 and humidity >= 80
-            )
-
+            is_heavy_snow = ("Snow" in weather_main and snow_3h >= 5 and temp <= 2)
+            is_heavy_rain = ("Rain" in weather_main and rain_3h >= 15)
+            is_dense_fog = (visibility <= 200 or "Fog" in weather_main or "Mist" in weather_main)
+            is_frost = (temp <= 3 and humidity >= 80)
             is_strong_wind = wind_speed >= 10
 
             row = {
@@ -197,7 +182,7 @@ def predict_delay():
             }
 
             all_rows.append(row)
-            all_datetimes.append(dt)
+            meta_info.append({"location": loc["name"], "datetime": dt})
 
     df = pd.DataFrame(all_rows)
 
@@ -205,17 +190,55 @@ def predict_delay():
     for col in model_features:
         if col not in df.columns:
             df[col] = 0
-
     df = df[model_features]
 
-    # 予測
+    # モデル一括予測
     y_pred = model.predict(df)
 
-    # 返すだけ（シンプル）
-    results = [
-        {"datetime": all_datetimes[i], "delay_probability": round(y_pred[i] * 100, 1)}
-        for i in range(len(y_pred))
+    # --------------------------------------------------------
+    # データ整形：地点ごと (Location-based) の結果を作成
+    # --------------------------------------------------------
+    location_outputs = {loc["name"]: [] for loc in weather_data}
+    
+    # 全データの日時ごとの確率を集計するための辞書 (全体平均用)
+    time_series_agg = {}
+
+    for i, pred in enumerate(y_pred):
+        loc_name = meta_info[i]["location"]
+        dt_str = meta_info[i]["datetime"]
+        prob = round(pred * 100, 1)
+
+        # 地点別のリストに追加
+        location_outputs[loc_name].append({
+            "datetime": dt_str,
+            "delay_probability": prob
+        })
+
+        # 全体平均用に日時ごとに確率をプール
+        if dt_str not in time_series_agg:
+            time_series_agg[dt_str] = []
+        time_series_agg[dt_str].append(prob)
+
+    # レスポンス用に辞書からリスト形式に変換
+    location_predictions = [
+        {"location": name, "predictions": preds}
+        for name, preds in location_outputs.items()
     ]
 
-    return {"source": weather_res["source"], "data": results}
+    # --------------------------------------------------------
+    # データ整形：路線全体 (Overall) の平均遅延確率を作成
+    # --------------------------------------------------------
+    overall_predictions = []
+    # 日時順に並び替えて全体平均を算出
+    for dt_str in sorted(time_series_agg.keys()):
+        avg_prob = round(np.mean(time_series_agg[dt_str]), 1)
+        overall_predictions.append({
+            "datetime": dt_str,
+            "overall_delay_probability": avg_prob
+        })
 
+    return {
+        "source": weather_res["source"],
+        "overall_prediction": overall_predictions,
+        "location_predictions": location_predictions
+    }
