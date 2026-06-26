@@ -10,54 +10,48 @@ import westjr
 CSV_FILE_PATH = "data/train_logs.csv"
 os.makedirs(os.path.dirname(CSV_FILE_PATH), exist_ok=True)
 
-# 設計書通りのカラムに固定
 CSV_HEADERS = ["timestamp", "train_no", "station_code", "direction", "delay_min", "congestion", "delay_cause"]
 
-# CSVがなければヘッダー付きで新規作成
 if not os.path.exists(CSV_FILE_PATH):
     with open(CSV_FILE_PATH, "w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
         writer.writerow(CSV_HEADERS)
 
-# 🌐 タイムスタンプを標準時（UTC）で統一
+# 🌐 タイムスタンプを標準時（UTC）で一貫
 current_timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-# 山陽本線（広島・山口エリア：sanyo2）を指定して初期化
 jr = westjr.WestJR(line="sanyo2", area="hiroshima")
 
-trains_list = []
-monitor_trains = {}
-delay_cause = "平常"
-
 # ==========================================
-# 📥 1. データの取得（エラーを個別にキャッチ）
+# 📥 1. データの取得と超安全なエラーハンドリング
 # ==========================================
 
 # --- 列車位置情報の取得 ---
 try:
     trains_res = jr.get_trains()
-    if trains_res and hasattr(trains_res, "trains") and trains_res.trains:
-        trains_list = trains_res.trains
-    else:
-        trains_list = []
+    if not trains_res or not hasattr(trains_res, "trains") or not trains_res.trains:
+        print(f"[{current_timestamp}] 走行中の列車データが0件のため、この5分は書き込みをスキップします。")
+        sys.exit(0)
+    trains_list = trains_res.trains
 except Exception as api_err:
-    print(f"[{current_timestamp}] 警告: 列車位置データ異常のためこの5分はスキップします: {api_err}", file=sys.stderr)
-    trains_list = []
+    # 🌟 ここがポイント！野生のデータ異常を検知したら、ログを残して「正常終了」させる
+    print(f"[{current_timestamp}] 警告: JR西日本APIの内部データ異常（destがNone等）を検知しました。")
+    print(f"詳細エラー: {api_err}")
+    print("システムを保護するため、今回の収集は安全にスキップ（正常終了）し、5分後の次回に期待します。")
+    sys.exit(0)
 
 # --- 混雑情報の取得 ---
 try:
     monitor_res = jr.get_train_monitor_info()
-    if monitor_res and hasattr(monitor_res, "trains") and monitor_res.trains:
-        monitor_trains = monitor_res.trains
-    else:
-        monitor_trains = {}
+    monitor_trains = monitor_res.trains if (monitor_res and hasattr(monitor_res, "trains")) else {}
 except Exception as api_err:
-    print(f"[{current_timestamp}] 警告: 混雑情報APIの取得に失敗: {api_err}", file=sys.stderr)
+    print(f"[{current_timestamp}] 警告: 混雑情報APIの取得に失敗 (スキップ): {api_err}", file=sys.stderr)
     monitor_trains = {}
 
 # --- 運行情報の取得 ---
 try:
     traffic_info = jr.get_traffic_info()
+    delay_cause = "平常"
     if traffic_info and hasattr(traffic_info, "lines") and traffic_info.lines:
         target_line = "sanyo2"
         if target_line in traffic_info.lines:
@@ -102,16 +96,14 @@ for t in trains_list:
         continue
 
 # ==========================================
-# 💾 3. 物理ディスクへの即時同期と書き込み
+# 💾 3. 物理ディスクへの書き込み
 # ==========================================
 if parsed_records:
     with open(CSV_FILE_PATH, "a", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
         writer.writerows(parsed_records)
-        
         f.flush()
         os.fsync(f.fileno())
     print(f"[{current_timestamp}] {len(parsed_records)} 件の列車レコードをUTCで同期保存しました。")
 else:
-    print(f"[{current_timestamp}] 走行中の列車データが0件、またはデータ異常のため書き込みをスキップしました（正常終了）。")
-    sys.exit(0)
+    print(f"[{current_timestamp}] 保存すべきデータがありませんでした。")
