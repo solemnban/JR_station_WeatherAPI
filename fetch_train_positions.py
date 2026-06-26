@@ -19,38 +19,53 @@ if not os.path.exists(CSV_FILE_PATH):
         writer = csv.writer(f)
         writer.writerow(CSV_HEADERS)
 
+# 🌐 タイムスタンプを標準時（UTC）で統一
+current_timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
 # 山陽本線（広島・山口エリア：sanyo2）を指定して初期化
 jr = westjr.WestJR(line="sanyo2", area="hiroshima")
 
-# ==========================================
-# 📥 1. データの取得と整形
-# ==========================================
-try:
-    current_timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-    # APIリクエスト
-    trains_res = jr.get_trains()
-    trains_list = trains_res.trains if hasattr(trains_res, "trains") else []
-    
-    monitor_res = jr.get_train_monitor_info()
-    monitor_trains = monitor_res.trains if hasattr(monitor_res, "trains") else {}
-    
-    traffic_info = jr.get_traffic_info()
-
-except Exception as api_err:
-    print(f"[{datetime.now()}] API取得フェーズで致命的なエラー: {api_err}", file=sys.stderr)
-    sys.exit(1)
-
-# --- 運行情報のパース ---
+trains_list = []
+monitor_trains = {}
 delay_cause = "平常"
+
+# ==========================================
+# 📥 1. データの取得（エラーを個別にキャッチ）
+# ==========================================
+
+# --- 列車位置情報の取得 ---
 try:
-    if hasattr(traffic_info, "lines") and traffic_info.lines:
+    trains_res = jr.get_trains()
+    if trains_res and hasattr(trains_res, "trains") and trains_res.trains:
+        trains_list = trains_res.trains
+    else:
+        trains_list = []
+except Exception as api_err:
+    print(f"[{current_timestamp}] 警告: 列車位置データ異常のためこの5分はスキップします: {api_err}", file=sys.stderr)
+    trains_list = []
+
+# --- 混雑情報の取得 ---
+try:
+    monitor_res = jr.get_train_monitor_info()
+    if monitor_res and hasattr(monitor_res, "trains") and monitor_res.trains:
+        monitor_trains = monitor_res.trains
+    else:
+        monitor_trains = {}
+except Exception as api_err:
+    print(f"[{current_timestamp}] 警告: 混雑情報APIの取得に失敗: {api_err}", file=sys.stderr)
+    monitor_trains = {}
+
+# --- 運行情報の取得 ---
+try:
+    traffic_info = jr.get_traffic_info()
+    if traffic_info and hasattr(traffic_info, "lines") and traffic_info.lines:
         target_line = "sanyo2"
         if target_line in traffic_info.lines:
             sanyo_info = traffic_info.lines[target_line]
             delay_cause = getattr(sanyo_info, "cause", None) or getattr(sanyo_info, "status", None) or "一部列車遅延"
-except Exception:
-    delay_cause = "データパースエラー"
+except Exception as api_err:
+    print(f"[{current_timestamp}] 警告: 運行情報APIの取得に失敗: {api_err}", file=sys.stderr)
+    delay_cause = "平常"
 
 # ==========================================
 # 🔄 2. 列車ごとのレコード結合処理
@@ -59,17 +74,22 @@ parsed_records = []
 
 for t in trains_list:
     try:
+        if not t or not hasattr(t, "no"):
+            continue
+            
         train_no = t.no
-        station_code = t.pos.split("_")[0] if t.pos else "####"
-        direction = t.direction
-        delay_min = t.delayMinutes if t.delayMinutes is not None else 0
+        station_code = t.pos.split("_")[0] if getattr(t, "pos", None) else "####"
+        direction = getattr(t, "direction", 0)
+        delay_min = getattr(t, "delayMinutes", 0)
+        if delay_min is None:
+            delay_min = 0
 
         # --- 混雑情報のパース ---
         congestion = 0
         try:
             if train_no in monitor_trains and monitor_trains[train_no]:
                 first_car_group = monitor_trains[train_no][0]
-                if hasattr(first_car_group, "cars") and len(first_car_group.cars) > 0:
+                if first_car_group and hasattr(first_car_group, "cars") and first_car_group.cars:
                     congestion = first_car_group.cars[0].congestion
         except Exception:
             congestion = 0
@@ -78,7 +98,7 @@ for t in trains_list:
             current_timestamp, train_no, station_code, direction, delay_min, congestion, delay_cause
         ])
     except Exception as row_err:
-        print(f"列車個別データのパーススキップ ({getattr(t, 'no', 'Unknown')}): {row_err}", file=sys.stderr)
+        print(f"列車個別データのパーススキップ: {row_err}", file=sys.stderr)
         continue
 
 # ==========================================
@@ -89,9 +109,9 @@ if parsed_records:
         writer = csv.writer(f)
         writer.writerows(parsed_records)
         
-        # 仮想環境のディスクへ即時フラッシュ
         f.flush()
         os.fsync(f.fileno())
-    print(f"[{current_timestamp}] {len(parsed_records)} 件の列車レコードを同期保存しました。")
+    print(f"[{current_timestamp}] {len(parsed_records)} 件の列車レコードをUTCで同期保存しました。")
 else:
-    print(f"[{current_timestamp}] 走行中の列車データが0件のためスキップしました。")
+    print(f"[{current_timestamp}] 走行中の列車データが0件、またはデータ異常のため書き込みをスキップしました（正常終了）。")
+    sys.exit(0)
