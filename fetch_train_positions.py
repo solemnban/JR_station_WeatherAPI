@@ -1,8 +1,8 @@
 import os
 import csv
 import sys
+import requests
 from datetime import datetime
-import westjr
 
 # ==========================================
 # ⚙️ 設定と初期化
@@ -10,93 +10,86 @@ import westjr
 CSV_FILE_PATH = "data/train_logs.csv"
 os.makedirs(os.path.dirname(CSV_FILE_PATH), exist_ok=True)
 
-CSV_HEADERS = ["timestamp", "train_no", "station_code", "direction", "delay_min", "congestion", "delay_cause"]
+# 📊 列車データの標準的な7カラム
+CSV_HEADERS = [
+    "timestamp", "train_no", "station_code", "direction", 
+    "delay_min", "congestion", "delay_cause"
+]
 
+# 初回実行時のみヘッダーを書き込み
 if not os.path.exists(CSV_FILE_PATH):
     with open(CSV_FILE_PATH, "w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
         writer.writerow(CSV_HEADERS)
 
-# 🌐 タイムスタンプを標準時（UTC）で一貫
 current_timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+TRAIN_URL = "https://train-guide.westjr.co.jp/api/v3/sanyo2.json"
 
-jr = westjr.WestJR(line="sanyo2", area="hiroshima")
+HTTP_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko)"
+}
 
 # ==========================================
-# 📥 1. データの取得と超安全なエラーハンドリング
+# 📥 1. 列車データの取得
 # ==========================================
-
-# --- 列車位置情報の取得 ---
 try:
-    trains_res = jr.get_trains()
-    if not trains_res or not hasattr(trains_res, "trains") or not trains_res.trains:
-        print(f"[{current_timestamp}] 走行中の列車データが0件のため、この5分は書き込みをスキップします。")
-        sys.exit(0)
-    trains_list = trains_res.trains
-except Exception as api_err:
-    # 🌟 ここがポイント！野生のデータ異常を検知したら、ログを残して「正常終了」させる
-    print(f"[{current_timestamp}] 警告: JR西日本APIの内部データ異常（destがNone等）を検知しました。")
-    print(f"詳細エラー: {api_err}")
-    print("システムを保護するため、今回の収集は安全にスキップ（正常終了）し、5分後の次回に期待します。")
+    response = requests.get(TRAIN_URL, headers=HTTP_HEADERS, timeout=15)
+    response.raise_for_status()
+    train_data = response.json()
+except Exception as e:
+    print(f"[{current_timestamp}] 警告: JR西日本サーバーへの接続失敗: {e}")
     sys.exit(0)
 
-# --- 混雑情報の取得 ---
-try:
-    monitor_res = jr.get_train_monitor_info()
-    monitor_trains = monitor_res.trains if (monitor_res and hasattr(monitor_res, "trains")) else {}
-except Exception as api_err:
-    print(f"[{current_timestamp}] 警告: 混雑情報APIの取得に失敗 (スキップ): {api_err}", file=sys.stderr)
-    monitor_trains = {}
-
-# --- 運行情報の取得 ---
-try:
-    traffic_info = jr.get_traffic_info()
-    delay_cause = "平常"
-    if traffic_info and hasattr(traffic_info, "lines") and traffic_info.lines:
-        target_line = "sanyo2"
-        if target_line in traffic_info.lines:
-            sanyo_info = traffic_info.lines[target_line]
-            delay_cause = getattr(sanyo_info, "cause", None) or getattr(sanyo_info, "status", None) or "一部列車遅延"
-except Exception as api_err:
-    print(f"[{current_timestamp}] 警告: 運行情報APIの取得に失敗: {api_err}", file=sys.stderr)
-    delay_cause = "平常"
+# 🌟 JR西日本が発表している全体の遅延理由（notice）をルート階層から取得
+# 例: "大雨のため、一部列車に遅延が..."。発表が無い場合は空文字やNoneになるため安全に処理
+raw_notice = train_data.get("notice")
+if raw_notice:
+    # 改行や不要な空白を除去して1行のクリーンなテキストにする
+    global_delay_cause = raw_notice.replace("\n", " ").replace("\r", "").strip()
+else:
+    global_delay_cause = "平常"
 
 # ==========================================
-# 🔄 2. 列車ごとのレコード結合処理
+# 🔄 2. 列車データの処理と結合
 # ==========================================
 parsed_records = []
+trains_list = train_data.get("trains", [])
+
+if not trains_list:
+    print(f"[{current_timestamp}] 走行中の列車データが0件のためスキップします。")
+    sys.exit(0)
 
 for t in trains_list:
     try:
-        if not t or not hasattr(t, "no"):
-            continue
-            
-        train_no = t.no
-        station_code = t.pos.split("_")[0] if getattr(t, "pos", None) else "####"
-        direction = getattr(t, "direction", 0)
-        delay_min = getattr(t, "delayMinutes", 0)
+        train_no = t.get("no", "Unknown")
+        pos_raw = t.get("pos", "####_####")
+        station_code = pos_raw.split("_")[0] if pos_raw else "####"
+        direction = t.get("direction", 0)
+        
+        delay_min = t.get("delayMinutes", 0)
         if delay_min is None:
             delay_min = 0
 
-        # --- 混雑情報のパース ---
+        # 🌟 【重要修正】
+        # その列車が「実際に1分以上遅延している」場合のみ、全体のお知らせ（遅延理由）を記録
+        # 遅延していない（0分）なら、一律で「平常」として保存
+        if delay_min > 0:
+            actual_cause = global_delay_cause if global_delay_cause != "平常" else "一部列車遅延"
+        else:
+            actual_cause = "平常"
+
+        # 混雑度はAPI側に無いため一律0で固定
         congestion = 0
-        try:
-            if train_no in monitor_trains and monitor_trains[train_no]:
-                first_car_group = monitor_trains[train_no][0]
-                if first_car_group and hasattr(first_car_group, "cars") and first_car_group.cars:
-                    congestion = first_car_group.cars[0].congestion
-        except Exception:
-            congestion = 0
 
         parsed_records.append([
-            current_timestamp, train_no, station_code, direction, delay_min, congestion, delay_cause
+            current_timestamp, train_no, station_code, direction, 
+            delay_min, congestion, actual_cause
         ])
-    except Exception as row_err:
-        print(f"列車個別データのパーススキップ: {row_err}", file=sys.stderr)
+    except Exception:
         continue
 
 # ==========================================
-# 💾 3. 物理ディスクへの書き込み
+# 💾 3. CSVへの追記保存
 # ==========================================
 if parsed_records:
     with open(CSV_FILE_PATH, "a", newline="", encoding="utf-8") as f:
@@ -104,6 +97,4 @@ if parsed_records:
         writer.writerows(parsed_records)
         f.flush()
         os.fsync(f.fileno())
-    print(f"[{current_timestamp}] {len(parsed_records)} 件の列車レコードをUTCで同期保存しました。")
-else:
-    print(f"[{current_timestamp}] 保存すべきデータがありませんでした。")
+    print(f"[{current_timestamp}] 列車位置ログの修正版保存に成功しました（遅延理由を正常化）。")
